@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import sqlite3
 import sys
 import time
@@ -549,11 +550,21 @@ def _busy(me: str) -> bool:
     return bool(unread or any(work.values()))
 
 
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 async def _wait(me: str, timeout: float, parent: int | None = None) -> dict[str, Any]:
     """Poll until events or timeout. With `parent`, stop without consuming anything once that process is gone."""
     deadline = time.monotonic() + timeout
     while True:
-        if parent is not None and os.getppid() != parent:
+        if parent is not None and not _alive(parent):
             log.warning("parent process exited, listener stops", extra={"ctx": {"agent": me, "parent": parent}})
             return {"status": "idle", "events": []}
         found = await asyncio.to_thread(_poll, me)
@@ -675,7 +686,7 @@ def _cli_wait(args: argparse.Namespace) -> int:
     if args.only_if_busy and not _busy(me):
         return 0 if args.format == "claude-hook" else EXIT["idle"]
     timeout = args.timeout if args.timeout is not None else TEAM.idle_timeout_minutes * 60
-    result = asyncio.run(_wait(me, timeout, parent=os.getppid()))
+    result = asyncio.run(_wait(me, timeout, parent=args.parent or os.getppid()))
     log.info("cli wait", extra={"ctx": {"agent": me, "status": result["status"], "events": len(result["events"])}})
     if args.format == "claude-hook":
         if result["status"] == "events":
@@ -687,21 +698,156 @@ def _cli_wait(args: argparse.Namespace) -> int:
     return EXIT[result["status"]]
 
 
+SERVER_PATH = Path(__file__).resolve()
+ADAPTERS = SERVER_PATH.parent / "adapters"
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConclaveError(f"{path} is not valid JSON ({exc}). Fix it or move it away, then run init again.") from exc
+    if not isinstance(data, dict):
+        raise ConclaveError(f"{path} must contain a JSON object.")
+    return data
+
+
+def _write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def _ensure_member(agent: str, role: str | None) -> str:
+    """Return the agent's role, adding the agent to team.json when --role is given and it is missing."""
+    team = Team.model_validate_json(TEAM_PATH.read_text(encoding="utf-8"))
+    if agent in team.agents:
+        if role and team.agents[agent].role != role:
+            raise ConclaveError(f"{agent!r} is already a {team.agents[agent].role} in {TEAM_PATH}. Edit it there.")
+        return team.agents[agent].role
+    if role is None:
+        raise ConclaveError(f"{agent!r} is not in {TEAM_PATH} ({list(team.agents)}). Add it there or pass --role.")
+    team.agents[agent] = AgentSpec.model_validate({"role": role})
+    team = Team.model_validate(team.model_dump())
+    _atomic_write(TEAM_PATH, team.model_dump_json(indent=2) + "\n")
+    return role
+
+
+def _install_opencode(project: Path, agent: str, role: str) -> list[str]:
+    config = project / "opencode.json"
+    if (project / "opencode.jsonc").exists():
+        raise ConclaveError(f"{project / 'opencode.jsonc'} exists. Move its content to opencode.json, then run init.")
+    data = _read_json(config)
+    data.setdefault("$schema", "https://opencode.ai/config.json")
+    data.setdefault("mcp", {})["conclave"] = {
+        "type": "local",
+        "command": [sys.executable, str(SERVER_PATH)],
+        "enabled": True,
+        "environment": {
+            "CONCLAVE_HOME": str(HOME),
+            "CONCLAVE_AGENT_ID": "{env:CONCLAVE_AGENT_ID}",
+            "CONCLAVE_WAIT_TOOL": "instant",
+        },
+    }
+    _write_json(config, data)
+    link = project / ".opencode" / "plugin" / "conclave.ts"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    target = ADAPTERS / "opencode" / "conclave.ts"
+    if link.is_symlink() or link.exists():
+        if link.resolve() != target:
+            raise ConclaveError(f"{link} already exists and is not Conclave's plugin. Move it away, then run init.")
+    else:
+        link.symlink_to(target)
+    return [str(config), f"{link} -> {target}"]
+
+
+def _install_claude_code(project: Path, agent: str, role: str) -> list[str]:
+    mcp_json = project / ".mcp.json"
+    data = _read_json(mcp_json)
+    data.setdefault("mcpServers", {})["conclave"] = {
+        "command": sys.executable,
+        "args": [str(SERVER_PATH)],
+        "env": {"CONCLAVE_HOME": str(HOME), "CONCLAVE_AGENT_ID": agent, "CONCLAVE_WAIT_TOOL": "instant"},
+    }
+    _write_json(mcp_json, data)
+    busy = " --only-if-busy" if role == "chief" else ""
+    command = (
+        f"CONCLAVE_HOME={shlex.quote(str(HOME))} {shlex.quote(sys.executable)} {shlex.quote(str(SERVER_PATH))} "
+        f"wait --agent {agent}{busy} --format claude-hook"
+    )
+    settings_path = project / ".claude" / "settings.local.json"
+    settings = _read_json(settings_path)
+    stop = settings.setdefault("hooks", {}).setdefault("Stop", [])
+    stop[:] = [
+        g
+        for g in stop
+        if not any("server.py" in h.get("command", "") and " wait " in h.get("command", "") for h in g.get("hooks", []))
+    ]
+    stop.append({"hooks": [{"type": "command", "command": command, "timeout": TEAM.idle_timeout_minutes * 60 + 60}]})
+    _write_json(settings_path, settings)
+    return [str(mcp_json), str(settings_path)]
+
+
+INSTALLERS: dict[str, Callable[[Path, str, str], list[str]]] = {
+    "opencode": _install_opencode,
+    "claude-code": _install_claude_code,
+}
+LAUNCH = {
+    "opencode": "CONCLAVE_AGENT_ID={agent} opencode",
+    "claude-code": "claude   (approve the 'conclave' MCP server when asked)",
+}
+
+
+def _cli_init(args: argparse.Namespace) -> int:
+    project = Path(args.project).resolve()
+    if not project.is_dir():
+        raise ConclaveError(f"{project} is not a folder.")
+    agent = _member_name(args.agent)
+    role = _ensure_member(agent, args.role)
+    written = INSTALLERS[args.client](project, agent, role)
+    print(f"Conclave set up for {agent} ({role}) on {args.client} in {project}")
+    print(f"Shared data: {HOME}  (every agent of this team must use it)")
+    for item in written:
+        print(f"  wrote {item}")
+    print(f"\nStart the agent from {project}:\n  {LAUNCH[args.client].format(agent=agent)}")
+    print(
+        f"Then give it the {'chief' if role == 'chief' else 'worker or reviewer'} prompt "
+        f"from {SERVER_PATH.parent / 'README.md'}."
+    )
+    return 0
+
+
+def _member_name(agent: str) -> str:
+    if not re.fullmatch(NAME_PATTERN, agent):
+        raise ConclaveError(f"{agent!r} is not a valid agent name (lowercase letters, digits, - or _).")
+    return agent
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="conclave", description="Conclave MCP server and wait helper.")
+    parser = argparse.ArgumentParser(prog="conclave", description="Conclave MCP server, wait helper and installer.")
     sub = parser.add_subparsers(dest="command")
     wait = sub.add_parser("wait", help="Block until the agent has events. Exit 0 events, 3 idle timeout.")
     wait.add_argument("--agent", required=True)
     wait.add_argument("--timeout", type=float, help="Seconds. Defaults to idle_timeout_minutes from team.json.")
     wait.add_argument("--format", choices=["json", "prompt", "claude-hook"], default="json")
     wait.add_argument("--only-if-busy", action="store_true", help="Return at once unless the agent awaits something.")
+    wait.add_argument("--parent", type=int, help="Stop without consuming events once this process is gone.")
+    init = sub.add_parser(
+        "init", help="Set up a client for one agent in a project. Uses CONCLAVE_HOME for shared data."
+    )
+    init.add_argument("--client", required=True, choices=sorted(INSTALLERS))
+    init.add_argument("--agent", required=True)
+    init.add_argument("--role", choices=["chief", "worker", "reviewer"], help="Add the agent to team.json if missing.")
+    init.add_argument("--project", default=".", help="Project folder to configure. Defaults to the current folder.")
     args = parser.parse_args()
     _init_storage()
-    if args.command == "wait":
+    commands = {"wait": _cli_wait, "init": _cli_init}
+    if args.command in commands:
         try:
-            raise SystemExit(_cli_wait(args))
+            raise SystemExit(commands[args.command](args))
         except ConclaveError as exc:
-            raise SystemExit(f"conclave wait: {exc}") from exc
+            raise SystemExit(f"conclave {args.command}: {exc}") from exc
     log.info("conclave started", extra={"ctx": {"home": str(HOME), "team": str(TEAM_PATH), "bound_agent": BOUND_AGENT}})
     mcp.run()
 

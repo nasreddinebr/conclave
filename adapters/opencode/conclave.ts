@@ -5,6 +5,8 @@ import type { Plugin } from "@opencode-ai/plugin"
 export const Conclave: Plugin = async ({ client, directory }) => {
   const agent = process.env.CONCLAVE_AGENT_ID
   type Variant = "info" | "success" | "warning" | "error"
+  const log = (level: "debug" | "info" | "warn" | "error", message: string) =>
+    client.app.log({ body: { service: "conclave", level, message } }).catch(() => {})
   const notify = (variant: Variant, message: string, duration = 8000) => {
     const level = variant === "success" ? "info" : variant === "warning" ? "warn" : variant
     client.app.log({ body: { service: "conclave", level, message } }).catch(() => {})
@@ -26,9 +28,16 @@ export const Conclave: Plugin = async ({ client, directory }) => {
     }
   }
 
-  const server = process.env.CONCLAVE_SERVER ?? `${directory}/conclave/server.py`
-  const python = process.env.CONCLAVE_PYTHON ?? server.replace(/server\.py$/, ".venv/bin/python")
-  const env = { ...process.env, CONCLAVE_HOME: process.env.CONCLAVE_HOME ?? `${directory}/conclave_data` }
+  // `server.py init` writes these into opencode.json; environment variables override them.
+  const configured = await readConclaveConfig(directory)
+  const python = process.env.CONCLAVE_PYTHON ?? configured.python
+  const server = process.env.CONCLAVE_SERVER ?? configured.server
+  const home = process.env.CONCLAVE_HOME ?? configured.home
+  if (!python || !server || !home) {
+    notify("error", `No "conclave" entry in ${directory}/opencode.json. Run: python <conclave>/server.py init --client opencode --agent ${agent}`, 30000)
+    return {}
+  }
+  const env = { ...process.env, CONCLAVE_HOME: home }
 
   let waiting = false
   let announced = false
@@ -40,7 +49,7 @@ export const Conclave: Plugin = async ({ client, directory }) => {
       notify("info", `Listening as ${agent}`)
     }
     try {
-      const proc = Bun.spawn([python, server, "wait", "--agent", agent, "--format", "prompt"], {
+      const proc = Bun.spawn([python, server, "wait", "--agent", agent, "--format", "prompt", "--parent", String(process.pid)], {
         env,
         stdout: "pipe",
         stderr: "pipe",
@@ -75,17 +84,37 @@ export const Conclave: Plugin = async ({ client, directory }) => {
     },
     // wait_for_work answering "idle" means the agent has nothing to do: end its turn for real (sleep), then listen.
     "tool.execute.after": async (input, output) => {
-      if (!input.tool.endsWith("wait_for_work") || !isIdle(output.output)) return
-      await client.session.abort({ path: { id: input.sessionID } }).catch(() => {})
+      if (!input.tool.endsWith("wait_for_work")) return
+      const idle = isIdle(output)
+      log("info", `after ${input.tool}: idle=${idle} output=${describe(output)}`)
+      if (!idle) return
+      try {
+        const res = await client.session.abort({ path: { id: input.sessionID } })
+        log("info", `put ${agent} to sleep: abort ${res.error ? "failed " + JSON.stringify(res.error) : "ok"}`)
+      } catch (err) {
+        notify("error", `could not put ${agent} to sleep: ${err}`, 30000)
+      }
       if (!waiting) void listen(input.sessionID)
     },
   }
 }
 
-function isIdle(output: string): boolean {
+function describe(value: unknown): string {
+  const text = typeof value === "string" ? value : JSON.stringify(value)
+  return `${typeof value}:${(text ?? "").slice(0, 160).replace(/\s+/g, " ")}`
+}
+
+async function readConclaveConfig(directory: string): Promise<{ python?: string; server?: string; home?: string }> {
   try {
-    return JSON.parse(output).status === "idle"
+    const entry = (await Bun.file(`${directory}/opencode.json`).json())?.mcp?.conclave
+    return { python: entry?.command?.[0], server: entry?.command?.[1], home: entry?.environment?.CONCLAVE_HOME }
   } catch {
-    return /"status"\s*:\s*"idle"/.test(output)
+    return {}
   }
+}
+
+// The tool result reaches plugins in different shapes depending on the OpenCode version: accept any of them.
+function isIdle(output: unknown): boolean {
+  const text = typeof output === "string" ? output : JSON.stringify(output) ?? ""
+  return /\\?"status\\?"\s*:\s*\\?"idle/.test(text)
 }

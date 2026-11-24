@@ -161,6 +161,14 @@ async def three_agent_flow(home: str) -> None:
         gone = subprocess.run(["kill", "-0", str(orphan)], capture_output=True).returncode != 0
         check("an orphaned listener exits and never consumes events",
               gone and any("Still there?" in m["content"] for m in inbox["messages"]), (gone, inbox))
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        await call(lead, "send_message", from_agent_id="leadtech", target_agent_id="dev",
+                   message_type="question", content="Parent already gone?")
+        late = cli(home, "wait", "--agent", "dev", "--timeout", "10", "--parent", str(dead.pid))
+        ok, inbox = await call(dev, "read_inbox", my_agent_id="dev")
+        check("a listener whose parent died before it started exits at once and consumes nothing",
+              late.returncode == 3 and any("Parent already gone?" in m["content"] for m in inbox["messages"]), (late, inbox))
         await call(dev, "send_message", from_agent_id="dev", target_agent_id="architecte",
                    message_type="question", content="Done?")
         hook = cli(home, "wait", "--agent", "architecte", "--only-if-busy", "--format", "claude-hook")
@@ -227,9 +235,62 @@ def bad_team(home: str) -> None:
         check(f"invalid team rejected: {needle}", r.returncode == 1 and needle in r.stderr, r.stderr)
 
 
+def init_flow(root: Path) -> None:
+    home, project = root / "data", root / "project"
+    project.mkdir()
+    (project / "opencode.json").write_text(json.dumps({"mcp": {"other": {"type": "local", "command": ["x"]}}}))
+    (project / ".claude").mkdir()
+    (project / ".claude" / "settings.local.json").write_text(json.dumps({"permissions": {"allow": ["Bash(ls)"]}}))
+
+    def init(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([sys.executable, str(SERVER), "init", *args], capture_output=True, text=True, timeout=20,
+                              cwd=project, env={**os.environ, "CONCLAVE_HOME": str(home)})
+
+    r = init("--client", "opencode", "--agent", "dev")
+    oc = json.loads((project / "opencode.json").read_text())
+    entry = oc["mcp"]["conclave"]
+    check("init opencode writes the conclave entry with absolute paths",
+          r.returncode == 0 and entry["command"] == [sys.executable, str(SERVER.resolve())]
+          and entry["environment"]["CONCLAVE_HOME"] == str(home), (r.stderr, entry))
+    check("init opencode keeps the other MCP servers", "other" in oc["mcp"], oc)
+    link = project / ".opencode" / "plugin" / "conclave.ts"
+    plugin = SERVER.resolve().parent / "adapters" / "opencode" / "conclave.ts"
+    check("init opencode links the plugin", link.is_symlink() and link.resolve() == plugin, link)
+    check("init prints how to start the agent", "CONCLAVE_AGENT_ID=dev opencode" in r.stdout, r.stdout)
+    before = (project / "opencode.json").read_text()
+    r = init("--client", "opencode", "--agent", "dev")
+    check("init opencode is idempotent", r.returncode == 0 and (project / "opencode.json").read_text() == before, r.stderr)
+
+    r = init("--client", "claude-code", "--agent", "architecte")
+    mcp_json = json.loads((project / ".mcp.json").read_text())
+    settings = json.loads((project / ".claude" / "settings.local.json").read_text())
+    hooks = [h["command"] for g in settings["hooks"]["Stop"] for h in g["hooks"]]
+    check("init claude-code binds the agent and keeps other settings",
+          r.returncode == 0 and mcp_json["mcpServers"]["conclave"]["env"]["CONCLAVE_AGENT_ID"] == "architecte"
+          and settings["permissions"] == {"allow": ["Bash(ls)"]}, (r.stderr, settings))
+    check("chief hook only waits when busy", len(hooks) == 1 and "--only-if-busy" in hooks[0], hooks)
+    ran = subprocess.run(["sh", "-c", hooks[0]], capture_output=True, text=True, timeout=20)
+    check("the generated hook command really runs", ran.returncode == 0 and ran.stdout == "", ran)
+    init("--client", "claude-code", "--agent", "leadtech")
+    settings = json.loads((project / ".claude" / "settings.local.json").read_text())
+    hooks = [h["command"] for g in settings["hooks"]["Stop"] for h in g["hooks"]]
+    check("re-init replaces the hook, a reviewer always listens", len(hooks) == 1 and "--only-if-busy" not in hooks[0]
+          and "--agent leadtech" in hooks[0], hooks)
+
+    r = init("--client", "opencode", "--agent", "qa")
+    check("unknown agent without --role is refused with a hint", r.returncode == 1 and "--role" in r.stderr, r.stderr)
+    r = init("--client", "opencode", "--agent", "qa", "--role", "reviewer")
+    team = json.loads((home / "team.json").read_text())
+    check("--role adds the agent to team.json", r.returncode == 0 and team["agents"]["qa"]["role"] == "reviewer", r.stderr)
+    r = init("--client", "opencode", "--agent", "dev", "--role", "chief")
+    check("a conflicting --role is refused", r.returncode == 1 and "already a worker" in r.stderr, r.stderr)
+
+
 async def main() -> None:
     root = Path(tempfile.mkdtemp(prefix="conclave-verify-"))
     homes = [str(root / n) for n in ("three", "two", "bad")]
+    (root / "init").mkdir()
+    init_flow(root / "init")
     for h in homes:
         Path(h).mkdir()
     await three_agent_flow(homes[0])

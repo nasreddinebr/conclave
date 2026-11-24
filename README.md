@@ -86,7 +86,7 @@ Python 3.11 or newer.
 cd conclave
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python verify.py      # 41 end-to-end checks across real server processes
+.venv/bin/python verify.py      # 61 end-to-end checks across real server processes
 ```
 
 If `.venv/bin/pip` does not exist (`No such file or directory`), the venv was created without pip. On Debian and Ubuntu this happens when `python3.X-venv` is missing. Running `python3 -m venv .venv` again does not add pip to an existing venv. Install the package (`sudo apt install python3.13-venv`), then run `rm -rf .venv` and repeat the steps above.
@@ -150,9 +150,42 @@ MCP only works in one direction. A server can't wake up a client. Conclave solve
 
 To support a new client, write an adapter that runs `server.py wait --agent <name> --format prompt` when the session goes idle, and sends stdout back into the session when the exit code is 0.
 
-### OpenCode
+### Setting up a project: `init`
 
-`opencode.json` in the project root (the same file works for every OpenCode agent):
+Run `init` once per agent, from your project folder, with the venv's Python. Every agent of a team must use the same `CONCLAVE_HOME`.
+
+```bash
+cd /path/to/your/project
+export CONCLAVE_HOME=$PWD/conclave_data
+
+/abs/path/conclave/.venv/bin/python /abs/path/conclave/server.py init --client claude-code --agent architecte
+/abs/path/conclave/.venv/bin/python /abs/path/conclave/server.py init --client opencode --agent dev
+/abs/path/conclave/.venv/bin/python /abs/path/conclave/server.py init --client opencode --agent qa --role reviewer
+```
+
+What it does:
+- **`team.json`.** It creates the default team if there is none. The agent must already be in it, unless `--role` is given, in which case it is added.
+- **`--client opencode`.** It adds a `conclave` entry to `opencode.json` and links the plugin into `.opencode/plugin/conclave.ts`. One `opencode.json` serves every OpenCode agent of the project, because the agent's name comes from `CONCLAVE_AGENT_ID` at launch.
+- **`--client claude-code`.** It adds a `conclave` entry to `.mcp.json`, bound to this agent, and the `Stop` hook to `.claude/settings.local.json`. A chief's hook only waits while it has work in flight. A worker's or reviewer's hook always waits for work.
+- **Your other settings are kept.** Other MCP servers, permissions and hooks stay as they were. Running `init` again converges to the same files. If a file is not valid JSON, `init` stops and says which one.
+- **It prints the command to start the agent.**
+
+Start each agent from the project folder:
+
+```bash
+CONCLAVE_AGENT_ID=dev opencode       # one terminal per OpenCode agent
+claude                               # approve the "conclave" MCP server when asked
+```
+
+Then give each agent its prompt from [Agent prompts](#agent-prompts).
+
+With OpenCode, put `CONCLAVE_AGENT_ID=<name>` on the same line as `opencode`. Without it, the plugin can't wake the session, and it shows a warning in OpenCode saying how to restart. The plugin finds the server, the Python interpreter and `CONCLAVE_HOME` in the `conclave` entry of `opencode.json`. `CONCLAVE_SERVER`, `CONCLAVE_PYTHON` and `CONCLAVE_HOME` override them. It shows a notification when it starts listening, when it stops, and on any error.
+
+With Claude Code, the session looks busy while the hook waits. Press Esc to take back control.
+
+### What `init` writes, for manual setups
+
+`opencode.json`:
 
 ```json
 {
@@ -172,20 +205,9 @@ To support a new client, write an adapter that runs `server.py wait --agent <nam
 }
 ```
 
-Install the plugin and start one terminal per agent:
+plus a link `.opencode/plugin/conclave.ts` to `adapters/opencode/conclave.ts`.
 
-```bash
-mkdir -p .opencode/plugin
-ln -s ../../conclave/adapters/opencode/conclave.ts .opencode/plugin/conclave.ts
-CONCLAVE_AGENT_ID=dev opencode
-CONCLAVE_AGENT_ID=leadtech opencode      # in a second terminal
-```
-
-The plugin reads `CONCLAVE_SERVER`, `CONCLAVE_PYTHON` and `CONCLAVE_HOME`. By default these are `<project>/conclave/server.py`, the venv next to it, and `<project>/conclave_data`. Put `CONCLAVE_AGENT_ID=<name>` on the same line as `opencode`. Without it, the plugin can't wake the session, and it shows a warning in OpenCode saying how to restart. The plugin also shows a notification when it starts listening, when it stops (idle timeout or project closed), and on any error.
-
-### Claude Code
-
-`.mcp.json` in the project root:
+`.mcp.json`:
 
 ```json
 {
@@ -199,7 +221,7 @@ The plugin reads `CONCLAVE_SERVER`, `CONCLAVE_PYTHON` and `CONCLAVE_HOME`. By de
 }
 ```
 
-Then merge `adapters/claude-code/settings.json` into `.claude/settings.local.json`, with your paths and agent name. The hook timeout (1860 s) must be longer than `idle_timeout_minutes`. While the hook waits, the session looks busy. Press Esc to take back control.
+plus the hook from `adapters/claude-code/settings.json` in `.claude/settings.local.json`. The hook timeout must be longer than `idle_timeout_minutes`.
 
 ### Claude Desktop and others
 
