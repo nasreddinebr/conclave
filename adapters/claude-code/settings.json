@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CONCLAVE_HOME=/abs/path/conclave_data /abs/path/conclave/.venv/bin/python /abs/path/conclave/server.py wait --agent architecte --only-if-busy --format claude-hook",
+            "timeout": 1860
+          }
+        ]
+      }
+    ]
+  }
+}
